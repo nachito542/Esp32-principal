@@ -1,182 +1,215 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WiFiUdp.h>
+#include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-// ================= CONFIG =================
+// --- RED ---
 const char* ssid = "Arac-rescue";
 const char* password = "password123";
+const char* server_commands = "http://192.168.4.2:5000/commands";
 
-const char* server_commands = "http://192.168.4.4:5000/commands";
+// --- HARDWARE ---
+// Se usa solo una instancia en la dirección 0x40
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 
-// UDP
-WiFiUDP udp;
-unsigned int localPort = 5000;
-char incomingPacket[255];
+#define SERVOMIN  150 
+#define SERVOMAX  600 
 
-// PCA9685
-#define PCA_SDA 21
-#define PCA_SCL 22
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+// Ángulos de movimiento
+const int SUBIR = 60, BAJAR = 90, AVANCE = 120, ATRAS = 60, CENTRO = 90;
+int angles[16]; // Para guardar los comandos del servidor
 
-int servo_angles[16];
+// --- PROTOTIPOS ---
+void posicionInicial();
+void adelante();
+void atras();
+void derecha();
+void izquierda();
+void moverGrupoA(int angFemur, int angCoxa);
+void moverGrupoB(int angFemur, int angCoxa);
+void moverServo(int canal, int angulo);
+void parsearComandos(String payload);
+void ejecutarMovimiento();
 
-// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n🕷️ ARAC-RESCUE INICIANDO");
-
-  // WiFi
+  
+  // Conexión WiFi
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED) { 
+    delay(500); 
+    Serial.print("."); 
   }
+  Serial.println("\n🌐 Conectado a Arac-rescue");
 
-  Serial.println("\n🌐 WiFi conectado");
-  Serial.println(WiFi.localIP());
-
-  // UDP
-  udp.begin(localPort);
-  Serial.printf("🟢 UDP puerto %d listo\n", localPort);
-
-  // PCA9685
-  Wire.begin(PCA_SDA, PCA_SCL);
-  pwm.begin();
-  pwm.setOscillatorFrequency(27000000);
-  pwm.setPWMFreq(50);
-
-  standCenter();
+  // Inicio de I2C en pines 21 y 22
+  Wire.begin(21, 22);
+  pca.begin();
+  pca.setPWMFreq(50);
+  
+  posicionInicial();
 }
 
-// ================= LOOP =================
 void loop() {
-
-  // 🔥 PRIORIDAD 1 → UDP (tiempo real)
-  if (checkUDP()) {
-    executeMovement();
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(server_commands);
+    http.setTimeout(1500);
+    
+    int code = http.GET();
+    if (code == 200) {
+      String payload = http.getString();
+      parsearComandos(payload);
+      ejecutarMovimiento();
+    } 
+    http.end();
   }
-  else {
-    // 🔵 PRIORIDAD 2 → HTTP (fallback)
-    String commands = getCommands();
-    if (commands.length() > 0) {
-      parseCommands(commands);
-      executeMovement();
-    }
-  }
-
-  delay(100);
+  delay(100); 
 }
 
-// ================= UDP =================
-bool checkUDP() {
-  int packetSize = udp.parsePacket();
-
-  if (packetSize) {
-    int len = udp.read(incomingPacket, 255);
-    if (len > 0) incomingPacket[len] = 0;
-
-    Serial.print("📩 UDP: ");
-    Serial.println(incomingPacket);
-
-    parseCommands(String(incomingPacket));
-
-    // Respuesta opcional
-    udp.beginPacket(udp.remoteIP(), udp.remotePort());
-    udp.print("OK");
-    udp.endPacket();
-
-    return true;
-  }
-
-  return false;
-}
-
-// ================= HTTP =================
-String getCommands() {
-  HTTPClient http;
-  http.begin(server_commands);
-  int code = http.GET();
-
-  String payload = "";
-  if (code == 200) {
-    payload = http.getString();
-    Serial.print("🌐 HTTP: ");
-    Serial.println(payload);
-  }
-
-  http.end();
-  return payload;
-}
-
-// ================= PARSER =================
-void parseCommands(String cmd_str) {
+// Desarma el texto "ch0:120,ch1:60..." del servidor Flask
+void parsearComandos(String payload) {
   int ch, ang;
-
-  char buffer[150];
-  cmd_str.toCharArray(buffer, 150);
-
+  char buffer[200];
+  payload.toCharArray(buffer, 200);
   char* token = strtok(buffer, ",");
-
   while (token != NULL) {
     if (sscanf(token, "ch%d:%d", &ch, &ang) == 2) {
-      if (ch < 16) {
-        servo_angles[ch] = ang;
-      }
+      if (ch < 16) angles[ch] = ang;
     }
     token = strtok(NULL, ",");
   }
 }
 
-// ================= MOVIMIENTO =================
-void executeMovement() {
+// Lógica de decisión según lo que procesó YOLO
+void ejecutarMovimiento() {
+  int ejeX = angles[0]; 
+  int ejeY = angles[1]; 
 
-  int ang0 = servo_angles[0];
-  int ang1 = servo_angles[1];
-
-  if (ang0 == 30 && ang1 == 150) {
-    Serial.println("🚶 ADELANTE");
-    walkForward();
-  }
-  else if (ang0 == 60 && ang1 == 60) {
-    Serial.println("↩️ IZQUIERDA");
-    turnLeft();
-  }
-  else if (ang0 == 120 && ang1 == 120) {
-    Serial.println("↪️ DERECHA");
-    turnRight();
+  if (ejeX >= 60 && ejeX < 120) {
+    izquierda();
+  } 
+  else if (ejeX >= 120 && ejeX < 150) {
+    derecha();
+  } 
+  else if (ejeY >= 150) {
+    adelante();
+  } 
+  else if (ejeY >= 30 && ejeX < 60) { // Suponiendo que ch1:30 es atrás en tu Python
+    atras();
   }
   else {
-    standCenter();
+    posicionInicial(); // Detenerse si no hay comandos claros
   }
 }
 
-// ================= SERVOS =================
-void setServo(int channel, int angle) {
-  angle = constrain(angle, 0, 180);
-  int pulse = map(angle, 0, 180, 150, 600);
-  pwm.setPWM(channel, 0, pulse);
-  servo_angles[channel] = angle;
+// --- FUNCIONES DE MOVIMIENTO ---
+
+void moverServo(int canal, int angulo) {
+  int pulso = map(angulo, 0, 180, SERVOMIN, SERVOMAX);
+  pca.setPWM(canal, 0, pulso);
 }
 
-// ================= ACCIONES =================
-void walkForward() {
-  Serial.println("Paso adelante");
-  // TODO: lógica real
-}
-
-void turnLeft() {
-  Serial.println("Giro izquierda");
-}
-
-void turnRight() {
-  Serial.println("Giro derecha");
-}
-
-void standCenter() {
-  for (int i = 0; i < 16; i++) {
-    setServo(i, 90);
+void posicionInicial() {
+  for(int i=0; i<16; i++) {
+    moverServo(i, CENTRO);
   }
+}
+
+void adelante() {
+  // --- GRUPO A AVANZA / GRUPO B SOPORTA ---
+  // 1. Levanta y adelanta el Grupo A. El Grupo B se queda fijo en el suelo.
+  moverGrupoA(SUBIR, AVANCE); 
+  moverGrupoB(BAJAR, CENTRO); 
+  delay(200);
+
+  // 2. Apoya el Grupo A en su nueva posición (adelantada).
+  moverGrupoA(BAJAR, AVANCE); 
+  delay(100);
+
+  // --- GRUPO B AVANZA / GRUPO A SOPORTA ---
+  // 3. Levanta y adelanta el Grupo B. El Grupo A se queda fijo en el suelo.
+  moverGrupoB(SUBIR, AVANCE);
+  moverGrupoA(BAJAR, CENTRO); 
+  delay(200);
+
+  // 4. Apoya el Grupo B en su nueva posición (adelantada).
+  moverGrupoB(BAJAR, AVANCE);
+  delay(100);
+  
+  // OPCIONAL: Reset de coxa para preparar el siguiente ciclo de empuje
+  // posicionInicial(); // Descomenta si notas que las patas se abren mucho
+}
+
+void atras() {
+  // --- GRUPO A RETROCEDE / GRUPO B SOPORTA ---
+  moverGrupoA(SUBIR, ATRAS); 
+  moverGrupoB(BAJAR, CENTRO); 
+  delay(200);
+
+  moverGrupoA(BAJAR, ATRAS); 
+  delay(100);
+
+  // --- GRUPO B RETROCEDE / GRUPO A SOPORTA ---
+  moverGrupoB(SUBIR, ATRAS);
+  moverGrupoA(BAJAR, CENTRO); 
+  delay(200);
+
+  moverGrupoB(BAJAR, ATRAS);
+  delay(100);
+}
+
+void izquierda() {
+  // Paso 1: Grupo A levanta y mueve hacia atrás
+  moverGrupoA(SUBIR, ATRAS); 
+  moverGrupoB(BAJAR, CENTRO); 
+  delay(200);
+  
+  moverGrupoA(BAJAR, ATRAS);
+  delay(100);
+
+  // Paso 2: Grupo B levanta y mueve hacia adelante
+  moverGrupoB(SUBIR, AVANCE);
+  moverGrupoA(BAJAR, CENTRO);
+  delay(200);
+
+  moverGrupoB(BAJAR, AVANCE);
+  delay(100);
+  posicionInicial();
+}
+
+void derecha() {
+  // Paso 1: Grupo A levanta y mueve a posición de giro
+  moverGrupoA(SUBIR, AVANCE); 
+  moverGrupoB(BAJAR, CENTRO); 
+  delay(200);
+  
+  moverGrupoA(BAJAR, AVANCE);
+  delay(100);
+
+  // Paso 2: Grupo B levanta y mueve en dirección opuesta para pivotar
+  moverGrupoB(SUBIR, ATRAS);
+  moverGrupoA(BAJAR, CENTRO);
+  delay(200);
+
+  moverGrupoB(BAJAR, ATRAS);
+  delay(100);
+  posicionInicial();
+}
+
+// Mapeo de canales para un solo PCA (Patas impares 1,3,5,7)
+void moverGrupoA(int angFemur, int angCoxa) {
+  moverServo(0, angCoxa);  moverServo(1, angFemur);  // Pata 1
+  moverServo(4, angCoxa);  moverServo(5, angFemur);  // Pata 3
+  moverServo(8, angCoxa);  moverServo(9, angFemur);  // Pata 5
+  moverServo(12, angCoxa); moverServo(13, angFemur); // Pata 7
+}
+
+// Mapeo de canales para un solo PCA (Patas pares 2,4,6,8)
+void moverGrupoB(int angFemur, int angCoxa) {
+  moverServo(2, angCoxa);  moverServo(3, angFemur);  // Pata 2
+  moverServo(6, angCoxa);  moverServo(7, angFemur);  // Pata 4
+  moverServo(10, angCoxa); moverServo(11, angFemur); // Pata 6
+  moverServo(14, angCoxa); moverServo(15, angFemur); // Pata 8
 }
